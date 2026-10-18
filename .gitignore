@@ -1,0 +1,9 @@
+node_modules/
+web/dist/
+data/*.db
+data/*.db-*
+.env
+test-results/
+playwright-report/
+e2e/.artifacts/
+*.log
