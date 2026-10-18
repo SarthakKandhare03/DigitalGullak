@@ -4,7 +4,7 @@ import type { Frequency, ISODate } from './dates';
 
 export type TxnKind = 'contribution' | 'withdrawal';
 export type TxnStatus = 'pending' | 'completed' | 'failed' | 'reversed';
-export type TxnOrigin = 'manual' | 'schedule' | 'sample';
+export type TxnOrigin = 'manual' | 'schedule' | 'sample' | 'reward';
 export type GoalStatus = 'active' | 'archived';
 export type ScheduleStatus = 'active' | 'paused' | 'cancelled';
 export type DemoScenario = 'confirm' | 'decline' | 'slow';

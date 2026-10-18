@@ -23,7 +23,7 @@ export async function publicRoutes(app: FastifyInstance, { services }: { service
     },
   }));
 
-  app.post('/api/auth/otp/request', async (request) => {
+  app.post('/api/auth/otp/request', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request) => {
     const body = parse(z.object({ phone: z.string().max(20) }), request.body);
     const challenge = auth.requestOtp(body.phone);
     return {
@@ -36,7 +36,7 @@ export async function publicRoutes(app: FastifyInstance, { services }: { service
     };
   });
 
-  app.post('/api/auth/otp/verify', async (request, reply) => {
+  app.post('/api/auth/otp/verify', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = parse(z.object({ challengeId: z.string().max(100), code: z.string().max(10) }), request.body);
     const result = await auth.verifyOtp(body.challengeId, body.code.trim());
     setSessionCookie(reply, USER_COOKIE, result.token, config.cookieSecure, 7 * 24 * 60 * 60);

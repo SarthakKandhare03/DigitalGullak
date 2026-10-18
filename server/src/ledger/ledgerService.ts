@@ -14,8 +14,10 @@ export interface CreateTransferInput {
   kind: TxnKind;
   amountPaise: number;
   idempotencyKey: string;
-  origin: 'manual' | 'schedule';
+  origin: 'manual' | 'schedule' | 'reward';
   scheduleId?: string;
+  /** Overrides the partner's funding-source label (used for reward credits). */
+  counterpartyLabel?: string;
   memo?: string;
   demoScenario?: DemoScenario;
   maxPaise?: number;
@@ -59,6 +61,32 @@ export class LedgerService {
   // -------------------------------------------------------------------------
   // Balances (always derived from the append-only ledger)
   // -------------------------------------------------------------------------
+
+  private listeners: Array<(txn: TxnRow, from: TxnStatus) => void> = [];
+
+  /** Registers a callback run inside the same DB transaction as every status change. */
+  onTransition(listener: (txn: TxnRow, from: TxnStatus) => void): void {
+    this.listeners.push(listener);
+  }
+
+  /** Balances for all of a user's goals in two grouped queries (avoids N+1 on lists). */
+  goalBalances(userId: string): Map<string, BalanceDTO> {
+    const posted = all<{ goal_id: string; total: number }>(
+      this.db,
+      `SELECT goal_id, SUM(amount_paise) AS total FROM ledger_entries WHERE user_id = ? AND account_type = 'pocket' GROUP BY goal_id`,
+      userId,
+    );
+    const pending = all<{ goal_id: string; kind: TxnKind; total: number }>(
+      this.db,
+      `SELECT goal_id, kind, SUM(amount_paise) AS total FROM transactions WHERE user_id = ? AND status = 'pending' GROUP BY goal_id, kind`,
+      userId,
+    );
+    const rows = new Map<string, { posted: number; pending_in: number; pending_out: number }>();
+    const row = (id: string) => rows.get(id) ?? rows.set(id, { posted: 0, pending_in: 0, pending_out: 0 }).get(id)!;
+    for (const p of posted) row(p.goal_id).posted = p.total;
+    for (const p of pending) row(p.goal_id)[p.kind === 'contribution' ? 'pending_in' : 'pending_out'] = p.total;
+    return new Map([...rows].map(([id, r]) => [id, toBalance(r)]));
+  }
 
   goalBalance(goalId: string): BalanceDTO {
     return toBalance(one(this.db, BALANCE_FOR_GOAL, goalId)!);
@@ -167,13 +195,13 @@ export class LedgerService {
         input.scheduleId ?? null,
         input.idempotencyKey,
         this.provider.id,
-        input.kind === 'contribution' ? account.fundingSourceLabel : account.payoutDestinationLabel,
+        input.counterpartyLabel ?? (input.kind === 'contribution' ? account.fundingSourceLabel : account.payoutDestinationLabel),
         input.memo ?? null,
         this.provider.isSimulated,
         now,
         now,
       );
-      this.addEvent(id, 'created', null, 'pending', input.origin === 'schedule' ? 'system' : 'user', null);
+      this.addEvent(id, 'created', null, 'pending', input.origin === 'manual' ? 'user' : 'system', null);
       input.inTx?.(id);
       return { id, replayed: false };
     });
@@ -272,6 +300,7 @@ export class LedgerService {
       txn.id,
     );
     this.addEvent(txn.id, 'status_changed', txn.status, to, actor, note);
+    for (const listener of this.listeners) listener({ ...txn, status: to }, txn.status);
     if (to === 'completed') this.post(txn, 'posting', now);
     if (to === 'reversed') this.post(txn, 'reversal', now);
   }

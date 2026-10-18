@@ -18,6 +18,8 @@ export interface AppConfig {
   mockWebhookSecret: string;
   mockSettleMs: number;
   cookieSecure: boolean;
+  /** Trust X-Forwarded-* only when behind a known reverse proxy (affects client IPs for rate limits). */
+  trustProxy: boolean;
   logLevel: string;
   webDistDir: string;
 }
@@ -77,6 +79,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, overrides: Part
     mockWebhookSecret: secret(env, 'MOCK_PROVIDER_WEBHOOK_SECRET', mode),
     mockSettleMs: Number.isFinite(settle) && settle >= 0 ? settle : 1800,
     cookieSecure: env.COOKIE_SECURE === 'true',
+    trustProxy: env.TRUST_PROXY === 'true',
     logLevel: env.LOG_LEVEL ?? (mode === 'test' ? 'silent' : 'info'),
     webDistDir: path.join(PROJECT_ROOT, 'web', 'dist'),
     ...overrides,

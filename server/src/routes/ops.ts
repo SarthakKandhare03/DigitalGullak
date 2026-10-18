@@ -11,7 +11,7 @@ const reason = z.string().min(5, 'Give a reason of at least 5 characters').max(5
 export async function opsRoutes(app: FastifyInstance, { services }: { services: Services }) {
   const { auth, ops, recon, exceptions, audit, config, ledger } = services;
 
-  app.post('/api/ops/session', async (request, reply) => {
+  app.post('/api/ops/session', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
     const body = parse(z.object({ passcode: z.string().min(1).max(200) }), request.body);
     const token = auth.operatorSignIn(body.passcode);
     setSessionCookie(reply, OPERATOR_COOKIE, token, config.cookieSecure, 8 * 60 * 60);

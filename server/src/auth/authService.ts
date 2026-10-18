@@ -12,6 +12,8 @@ const OTP_MAX_PER_WINDOW = 5;
 const OTP_WINDOW_MS = 15 * 60_000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60_000;
+const IDLE_TIMEOUT_MS = 30 * 60_000;
+const MAX_SESSIONS = 5;
 
 export const OPERATOR_ID = 'op_demo';
 
@@ -151,6 +153,18 @@ export class AuthService {
   private createSession(type: 'user' | 'operator', subjectId: string, ttlMs: number): string {
     const token = randomToken(32);
     const now = this.clock.now();
+    // Keep at most MAX_SESSIONS active sessions per subject; the oldest are signed out.
+    run(
+      this.db,
+      `UPDATE sessions SET revoked_at = ? WHERE id IN (
+         SELECT id FROM sessions WHERE subject_type = ? AND subject_id = ? AND revoked_at IS NULL AND expires_at > ?
+         ORDER BY created_at DESC LIMIT -1 OFFSET ?)`,
+      now.toISOString(),
+      type,
+      subjectId,
+      now.toISOString(),
+      MAX_SESSIONS - 1,
+    );
     run(
       this.db,
       `INSERT INTO sessions (id, subject_type, subject_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
@@ -165,14 +179,23 @@ export class AuthService {
 
   /** Returns the subject id for a valid session token, or null. */
   resolveSession(token: string | undefined, type: 'user' | 'operator'): string | null {
-    if (!token) return null;
-    const row = one<{ subject_id: string; expires_at: string; revoked_at: string | null }>(
+    if (!token || token.length > 100) return null;
+    const id = sha256Hex(token);
+    const row = one<{ subject_id: string; expires_at: string; revoked_at: string | null; created_at: string; last_seen_at: string | null }>(
       this.db,
-      'SELECT subject_id, expires_at, revoked_at FROM sessions WHERE id = ? AND subject_type = ?',
-      sha256Hex(token),
+      'SELECT subject_id, expires_at, revoked_at, created_at, last_seen_at FROM sessions WHERE id = ? AND subject_type = ?',
+      id,
       type,
     );
-    if (!row || row.revoked_at || row.expires_at < nowIso(this.clock)) return null;
+    const now = this.clock.now();
+    if (!row || row.revoked_at || row.expires_at < now.toISOString()) return null;
+    // Sliding idle timeout, as banking apps do. last_seen_at is refreshed at most once a minute.
+    const idleMs = now.getTime() - Date.parse(row.last_seen_at ?? row.created_at);
+    if (idleMs > IDLE_TIMEOUT_MS) {
+      run(this.db, 'UPDATE sessions SET revoked_at = ? WHERE id = ?', now.toISOString(), id);
+      return null;
+    }
+    if (idleMs > 60_000) run(this.db, 'UPDATE sessions SET last_seen_at = ? WHERE id = ?', now.toISOString(), id);
     if (type === 'user') {
       const user = one<{ status: string }>(this.db, 'SELECT status FROM users WHERE id = ?', row.subject_id);
       if (!user || user.status !== 'active') return null;

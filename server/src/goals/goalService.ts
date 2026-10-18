@@ -1,6 +1,6 @@
 import { isISODate } from '../../../shared/dates';
 import { MAX_TARGET_PAISE, MIN_TRANSFER_PAISE, formatINR } from '../../../shared/money';
-import { GOAL_ICONS, type GoalDTO, type GoalStatus } from '../../../shared/types';
+import { GOAL_ICONS, type BalanceDTO, type GoalDTO, type GoalStatus } from '../../../shared/types';
 import { all, one, run, tx, type DB } from '../db/db';
 import type { LedgerService } from '../ledger/ledgerService';
 import { nowIso, todayIST, type Clock } from '../lib/clock';
@@ -37,7 +37,7 @@ export class GoalService {
     private readonly clock: Clock,
   ) {}
 
-  private toDTO(row: GoalRow): GoalDTO {
+  private toDTO(row: GoalRow, balance?: BalanceDTO): GoalDTO {
     return {
       id: row.id,
       name: row.name,
@@ -49,7 +49,7 @@ export class GoalService {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       archivedAt: row.archived_at,
-      balance: this.ledger.goalBalance(row.id),
+      balance: balance ?? this.ledger.goalBalance(row.id),
     };
   }
 
@@ -60,8 +60,10 @@ export class GoalService {
   }
 
   list(userId: string, status: GoalStatus = 'active'): GoalDTO[] {
+    const balances = this.ledger.goalBalances(userId);
+    const empty = { postedPaise: 0, pendingInPaise: 0, pendingOutPaise: 0, availablePaise: 0 };
     return all<GoalRow>(this.db, 'SELECT * FROM goals WHERE user_id = ? AND status = ? ORDER BY created_at, id', userId, status).map((r) =>
-      this.toDTO(r),
+      this.toDTO(r, balances.get(r.id) ?? empty),
     );
   }
 

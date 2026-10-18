@@ -1,6 +1,9 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
+import fastifyRateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import Fastify, { type FastifyInstance } from 'fastify';
 import type { AppConfig } from './config';
@@ -33,6 +36,20 @@ export interface BuiltApp {
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+/** No inline scripts, no third-party origins, no framing. Inline style attributes are needed by React style props. */
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "object-src 'none'",
+].join('; ');
+
 export async function buildApp(options: BuildOptions): Promise<BuiltApp> {
   const { config } = options;
   const clock = options.clock ?? systemClock;
@@ -49,6 +66,8 @@ export async function buildApp(options: BuildOptions): Promise<BuiltApp> {
             redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers["x-mockbank-signature"]', 'res.headers["set-cookie"]'],
           },
     bodyLimit: 64 * 1024,
+    trustProxy: config.trustProxy,
+    genReqId: () => randomUUID(),
   });
   app.decorateRequest('userId', null);
   app.decorateRequest('operatorId', null);
@@ -84,19 +103,41 @@ export async function buildApp(options: BuildOptions): Promise<BuiltApp> {
   });
 
   await app.register(fastifyCookie);
+  await app.register(fastifyCompress, { threshold: 1024, encodings: ['br', 'gzip'] });
 
-  // CSRF defence in depth: SameSite=Strict cookies plus an Origin allow-list for state changes.
+  // Per-IP rate limits: a generous global ceiling, tighter limits on auth, games and ops routes.
+  // Signed partner webhooks are exempt (a live partner would also be IP allow-listed / mTLS).
+  await app.register(fastifyRateLimit, {
+    global: true,
+    max: 600,
+    timeWindow: '1 minute',
+    allowList: (request) => request.url.startsWith('/api/provider/webhooks/'),
+    errorResponseBuilder: (_request, context) => ({
+      statusCode: 429,
+      error: { code: 'rate_limited', message: `Too many requests. Please wait ${Math.ceil(context.ttl / 1000)} seconds and try again.` },
+    }),
+  });
+
+  // CSRF defence in depth: SameSite=Strict cookies, JSON-only bodies, an Origin
+  // allow-list, and Fetch Metadata (browsers label cross-site requests).
   app.addHook('onRequest', async (request) => {
     if (SAFE_METHODS.has(request.method) || !request.url.startsWith('/api/')) return;
     if (request.url.startsWith('/api/provider/webhooks/')) return;
     const origin = request.headers.origin;
     if (origin && !config.allowedOrigins.includes(origin)) throw forbidden('Request origin not allowed.');
+    if (request.headers['sec-fetch-site'] === 'cross-site') throw forbidden('Cross-site requests are not allowed.');
   });
 
   app.addHook('onSend', async (request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('Referrer-Policy', 'no-referrer');
     reply.header('X-Frame-Options', 'DENY');
+    reply.header('Content-Security-Policy', CSP);
+    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()');
+    reply.header('Cross-Origin-Opener-Policy', 'same-origin');
+    reply.header('Cross-Origin-Resource-Policy', 'same-origin');
+    if (config.cookieSecure) reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    reply.header('X-Request-Id', request.id);
     reply.header('X-Demo-Mode', 'simulated-money-only');
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
   });
@@ -106,6 +147,10 @@ export async function buildApp(options: BuildOptions): Promise<BuiltApp> {
       return reply.code(error.status).send({ error: { code: error.code, message: error.message, details: error.details } });
     }
     const status = (error as { statusCode?: number }).statusCode;
+    if (status === 429) {
+      const body = (error as { error?: { code: string; message: string } }).error;
+      return reply.code(429).send({ error: body ?? { code: 'rate_limited', message: 'Too many requests. Please wait and try again.' } });
+    }
     if (status && status >= 400 && status < 500) {
       return reply.code(status).send({ error: { code: 'bad_request', message: 'The request could not be processed.' } });
     }
@@ -119,7 +164,14 @@ export async function buildApp(options: BuildOptions): Promise<BuiltApp> {
 
   const serveWeb = options.serveWeb ?? true;
   if (serveWeb && existsSync(path.join(config.webDistDir, 'index.html'))) {
-    await app.register(fastifyStatic, { root: config.webDistDir, wildcard: false });
+    await app.register(fastifyStatic, {
+      root: config.webDistDir,
+      wildcard: false,
+      // Hashed build assets never change, so browsers may cache them for a year; the HTML shell always revalidates.
+      setHeaders: (res, filePath) => {
+        res.header('Cache-Control', /[\\/]assets[\\/]/.test(filePath) ? 'public, max-age=31536000, immutable' : 'no-cache');
+      },
+    });
     app.setNotFoundHandler((request, reply) => {
       if (request.url.startsWith('/api/') || request.method !== 'GET') {
         return reply.code(404).send({ error: { code: 'not_found', message: 'Not found.' } });

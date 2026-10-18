@@ -24,10 +24,22 @@ export function migrate(db: DB, log: (msg: string) => void = () => {}): string[]
       if (existing !== checksum) throw new Error(`Migration ${file} was changed after it was applied. Add a new migration instead.`);
       continue;
     }
-    tx(db, () => {
-      db.exec(sql);
-      run(db, 'INSERT INTO schema_migrations (name, checksum, applied_at) VALUES (?, ?, ?)', file, checksum, new Date().toISOString());
-    });
+    // Table rebuilds follow SQLite's documented procedure: foreign keys off
+    // (only possible outside a transaction), then verify integrity before COMMIT.
+    const foreignKeysOff = sql.startsWith('-- migrate:foreign-keys-off');
+    if (foreignKeysOff) db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      tx(db, () => {
+        db.exec(sql);
+        if (foreignKeysOff) {
+          const violations = all(db, 'PRAGMA foreign_key_check');
+          if (violations.length) throw new Error(`Migration ${file} left ${violations.length} foreign key violation(s).`);
+        }
+        run(db, 'INSERT INTO schema_migrations (name, checksum, applied_at) VALUES (?, ?, ?)', file, checksum, new Date().toISOString());
+      });
+    } finally {
+      if (foreignKeysOff) db.exec('PRAGMA foreign_keys = ON');
+    }
     log(`applied migration ${file}`);
     newlyApplied.push(file);
   }

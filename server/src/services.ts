@@ -5,6 +5,8 @@ import type { DB } from './db/db';
 import { DemoDataService } from './demo/demoData';
 import { GoalService } from './goals/goalService';
 import { ActivityService } from './ledger/activityService';
+import { InsightsService } from './ledger/insightsService';
+import { RewardsService } from './rewards/rewardsService';
 import { LedgerService } from './ledger/ledgerService';
 import { ProviderAccounts } from './ledger/providerAccounts';
 import type { Clock } from './lib/clock';
@@ -42,7 +44,9 @@ export function createServices(deps: {
   const events = new ProviderEventProcessor(db, provider, ledger, exceptions, clock);
   const recon = new ReconciliationService(db, provider, ledger, exceptions, audit, clock, deps.reconciliation);
   const ops = new OpsService(db, provider, ledger, exceptions, recon, audit);
-  return { db, config, clock, provider, accounts, ledger, goals, schedules, activity, auth, demo, account, exceptions, audit, events, recon, ops };
+  const rewards = new RewardsService(db, ledger, clock);
+  const insights = new InsightsService(db, clock);
+  return { db, config, clock, provider, accounts, ledger, goals, schedules, activity, auth, demo, account, exceptions, audit, events, recon, ops, rewards, insights };
 }
 
 export type Services = ReturnType<typeof createServices>;

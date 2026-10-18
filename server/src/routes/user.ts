@@ -11,18 +11,18 @@ const paise = z.number().int().safe();
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const demoScenario = z.enum(['confirm', 'decline', 'slow']).optional();
 
-const goalBody = z.object({
+const goalBody = z.strictObject({
   name: z.string().max(80),
   icon: z.enum(GOAL_ICONS),
   targetPaise: paise,
   targetDate: isoDate.nullable(),
 });
 
-const transferBody = z.object({ amountPaise: paise, demoScenario });
+const transferBody = z.object({ amountPaise: paise, demoScenario }).strict();
 
 /** Every route here requires a signed-in user and scopes data to that user. */
 export async function userRoutes(app: FastifyInstance, { services }: { services: Services }) {
-  const { auth, account, goals, ledger, schedules, activity, db, clock } = services;
+  const { auth, account, goals, ledger, schedules, activity, db, clock, rewards, insights } = services;
 
   app.addHook('preHandler', async (request) => {
     const userId = auth.resolveSession(request.cookies[USER_COOKIE], 'user');
@@ -165,6 +165,46 @@ export async function userRoutes(app: FastifyInstance, { services }: { services:
       return schedules[action](userIdOf(request), scheduleId);
     });
   }
+
+  // --- Insights ------------------------------------------------------------
+  app.get('/api/insights/savings', async (request) => {
+    const query = parse(z.object({ range: z.enum(['1m', '3m', '6m', '1y']).default('3m') }), request.query);
+    return insights.savingsHistory(userIdOf(request), query.range);
+  });
+
+  // --- Rewards (gamification) ----------------------------------------------
+  const gameLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
+
+  app.get('/api/rewards', async (request) => rewards.summary(userIdOf(request)));
+
+  app.post('/api/rewards/quests/:questId/claim', gameLimit, async (request) => {
+    const { questId } = parse(z.object({ questId: z.string().max(40) }), request.params);
+    return rewards.claimQuest(userIdOf(request), questId);
+  });
+
+  app.post('/api/rewards/quiz/start', gameLimit, async (request) => rewards.startQuiz(userIdOf(request)));
+
+  app.post('/api/rewards/quiz/:sessionId/submit', gameLimit, async (request) => {
+    const { sessionId } = parse(z.object({ sessionId: id }), request.params);
+    const body = parse(z.object({ answers: z.array(z.number().int().min(0).max(9)).max(10) }).strict(), request.body);
+    return rewards.submitQuiz(userIdOf(request), sessionId, body.answers);
+  });
+
+  app.post('/api/rewards/coin-catch/start', gameLimit, async (request) => rewards.startCoinCatch(userIdOf(request)));
+
+  app.post('/api/rewards/coin-catch/:sessionId/finish', gameLimit, async (request) => {
+    const { sessionId } = parse(z.object({ sessionId: id }), request.params);
+    const body = parse(z.object({ caught: z.array(z.number().int().min(0).max(500)).max(200) }).strict(), request.body);
+    return rewards.finishCoinCatch(userIdOf(request), sessionId, body.caught);
+  });
+
+  app.post('/api/rewards/redeem', gameLimit, async (request, reply) => {
+    const key = requireIdempotencyKey(request.headers['idempotency-key']);
+    const body = parse(z.object({ goalId: id, points: z.number().int().safe() }).strict(), request.body);
+    const result = await rewards.redeem(userIdOf(request), body.goalId, body.points, key);
+    reply.code(result.transaction.status === 'pending' ? 202 : 200);
+    return result;
+  });
 
   app.post('/api/schedules/:scheduleId/simulate-run', async (request, reply) => {
     const { scheduleId } = parse(z.object({ scheduleId: id }), request.params);
