@@ -92,7 +92,7 @@ Digital Gullak goes the other way:
 > **Needs:** Node.js **22.13+** (it uses the built-in `node:sqlite`; tested on Node 25). No database server and no Docker.
 
 ```bash
-git clone https://github.com/sarthakkandhare03/DigitalGullak.git
+git clone https://github.com/SarthakKandhare03/DigitalGullak.git
 cd DigitalGullak
 npm install
 npm run setup     # writes .env with random secrets, runs migrations, seeds demo users
