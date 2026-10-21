@@ -2,15 +2,23 @@ import { randomUUID } from 'node:crypto';
 import type { InjectOptions } from 'fastify';
 import { buildApp } from '../src/app';
 import { readConfig } from '../src/config';
-import { openDatabase } from '../src/db/db';
+import { openDatabase, type DB } from '../src/db/db';
 import { ManualClock } from '../src/lib/clock';
 import { ManualScheduler } from '../src/providers/mock/scheduler';
 
-export async function createTestApp() {
-  const config = readConfig({ NODE_ENV: 'test', OPERATOR_PASSCODE: 'test-operator-passcode' } as NodeJS.ProcessEnv);
-  const clock = new ManualClock('2026-10-18T05:30:00.000Z');
+export interface TestAppOptions {
+  /** Extra environment variables for readConfig (e.g. COOKIE_SECURE, OPERATOR_TOTP_SECRET). */
+  env?: Record<string, string>;
+  /** Reuse a database (and clock) to simulate a restart or a second worker process. */
+  db?: DB;
+  clock?: ManualClock;
+}
+
+export async function createTestApp(options: TestAppOptions = {}) {
+  const config = readConfig({ NODE_ENV: 'test', OPERATOR_PASSCODE: 'test-operator-passcode', ...options.env } as NodeJS.ProcessEnv);
+  const clock = options.clock ?? new ManualClock('2026-10-18T05:30:00.000Z');
   const scheduler = new ManualScheduler();
-  const db = openDatabase(':memory:');
+  const db = options.db ?? openDatabase(':memory:');
   const built = await buildApp({ config, db, clock, scheduler, serveWeb: false, reconciliation: { graceMs: 30_000, stuckMs: 600_000 } });
   const { app } = built;
 

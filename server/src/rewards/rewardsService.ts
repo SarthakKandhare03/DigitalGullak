@@ -241,20 +241,30 @@ export class RewardsService {
     });
   }
 
-  /** Full rewards view. Newly earned achievements are awarded here (idempotently). */
-  summary(userId: string): RewardsSummaryDTO {
-    const streak = this.streak(userId);
-    const ctx = this.context(userId, streak.weeks);
-    const newlyUnlocked = tx(this.db, () =>
-      ACHIEVEMENTS.filter((a) => a.test(ctx) && this.award(userId, 'achievement', a.id, a.points, `Achievement: ${a.title}`)).map((a) => a.id),
-    );
-    const unlocked = new Map(
+  private unlockedAchievements(userId: string): Map<string, string> {
+    return new Map(
       all<{ source_ref: string; created_at: string }>(
         this.db,
         `SELECT source_ref, created_at FROM reward_points WHERE user_id = ? AND source = 'achievement'`,
         userId,
       ).map((r) => [r.source_ref, r.created_at]),
     );
+  }
+
+  /** Full rewards view. Newly earned achievements are awarded here (idempotently). */
+  summary(userId: string): RewardsSummaryDTO {
+    const streak = this.streak(userId);
+    const ctx = this.context(userId, streak.weeks);
+    let unlocked = this.unlockedAchievements(userId);
+    // Read-only on the common path: the write lock is taken only when something new was earned.
+    const earned = ACHIEVEMENTS.filter((a) => !unlocked.has(a.id) && a.test(ctx));
+    let newlyUnlocked: string[] = [];
+    if (earned.length) {
+      newlyUnlocked = tx(this.db, () =>
+        earned.filter((a) => this.award(userId, 'achievement', a.id, a.points, `Achievement: ${a.title}`)).map((a) => a.id),
+      );
+      unlocked = this.unlockedAchievements(userId);
+    }
     const today = this.today();
     const weekStart = weekStartOf(today);
     const points = this.balance(userId);

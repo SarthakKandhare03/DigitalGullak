@@ -5,6 +5,7 @@ import { nowIso, type Clock } from '../lib/clock';
 import { newId } from '../lib/crypto';
 import { conflict, notFound, unprocessable } from '../lib/errors';
 import { ProviderError, type BankPartnerProvider, type ProviderTransfer } from '../providers/types';
+import type { HashChain } from '../lib/hashChain';
 import type { ProviderAccounts } from './providerAccounts';
 import { TXN_SELECT, toBalance, toTransactionDTO, toTransactionEventDTO, type TxnEventRow, type TxnRow } from './rows';
 
@@ -40,12 +41,12 @@ const PATHS: Record<TxnStatus, Partial<Record<TxnStatus, TxnStatus[]>>> = {
 };
 
 const BALANCE_FOR_GOAL = `SELECT
-  COALESCE((SELECT SUM(amount_paise) FROM ledger_entries WHERE goal_id = ?1 AND account_type = 'pocket'), 0) AS posted,
+  COALESCE((SELECT posted_paise FROM goal_balances WHERE goal_id = ?1), 0) AS posted,
   COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE goal_id = ?1 AND status = 'pending' AND kind = 'contribution'), 0) AS pending_in,
   COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE goal_id = ?1 AND status = 'pending' AND kind = 'withdrawal'), 0) AS pending_out`;
 
 const BALANCE_FOR_USER = `SELECT
-  COALESCE((SELECT SUM(amount_paise) FROM ledger_entries WHERE user_id = ?1 AND account_type = 'pocket'), 0) AS posted,
+  COALESCE((SELECT SUM(posted_paise) FROM goal_balances WHERE user_id = ?1), 0) AS posted,
   COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE user_id = ?1 AND status = 'pending' AND kind = 'contribution'), 0) AS pending_in,
   COALESCE((SELECT SUM(amount_paise) FROM transactions WHERE user_id = ?1 AND status = 'pending' AND kind = 'withdrawal'), 0) AS pending_out`;
 
@@ -56,6 +57,7 @@ export class LedgerService {
     private readonly accounts: ProviderAccounts,
     private readonly clock: Clock,
     private readonly log: { warn: (obj: object, msg: string) => void },
+    private readonly chain: HashChain,
   ) {}
 
   // -------------------------------------------------------------------------
@@ -73,7 +75,7 @@ export class LedgerService {
   goalBalances(userId: string): Map<string, BalanceDTO> {
     const posted = all<{ goal_id: string; total: number }>(
       this.db,
-      `SELECT goal_id, SUM(amount_paise) AS total FROM ledger_entries WHERE user_id = ? AND account_type = 'pocket' GROUP BY goal_id`,
+      'SELECT goal_id, posted_paise AS total FROM goal_balances WHERE user_id = ?',
       userId,
     );
     const pending = all<{ goal_id: string; kind: TxnKind; total: number }>(
@@ -311,8 +313,10 @@ export class LedgerService {
     const pocketAmount = (entryType === 'posting' ? sign : -sign) * txn.amount_paise;
     const insert = `INSERT INTO ledger_entries (transaction_id, user_id, account_type, goal_id, amount_paise, entry_type, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)`;
-    run(this.db, insert, txn.id, txn.user_id, 'pocket', txn.goal_id, pocketAmount, entryType, at);
-    run(this.db, insert, txn.id, txn.user_id, 'external', null, -pocketAmount, entryType, at);
+    const pocket = run(this.db, insert, txn.id, txn.user_id, 'pocket', txn.goal_id, pocketAmount, entryType, at);
+    const external = run(this.db, insert, txn.id, txn.user_id, 'external', null, -pocketAmount, entryType, at);
+    this.chain.seal(pocket.lastInsertRowid);
+    this.chain.seal(external.lastInsertRowid);
   }
 
   addEvent(

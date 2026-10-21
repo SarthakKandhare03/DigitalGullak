@@ -125,6 +125,8 @@ function toPayloadTransfer(row: TransferRow) {
 
 export interface MockBankOptions {
   webhookSecret: string;
+  /** Previous secret, still accepted while a rotation is in progress. */
+  previousWebhookSecret?: string | null;
   settleMs: number;
   clock: Clock;
   scheduler: Scheduler;
@@ -274,13 +276,15 @@ export class MockBankProvider implements BankPartnerProvider {
         now,
       );
       const created = one<TransferRow>(this.db, 'SELECT * FROM mockbank_transfers WHERE id = ?', id)!;
-      if (status === 'failed') this.recordEvent(created, 'transfer.failed', 'pending');
-      return created;
+      const eventId = status === 'failed' ? this.recordEvent(created, 'transfer.failed', 'pending') : null;
+      return { created, eventId };
     });
 
-    if (status === 'failed') this.options.scheduler.schedule(() => this.flushPendingEvents(), 0);
-    else if (scenario !== 'slow') this.options.scheduler.schedule(() => this.settle(id), this.options.settleMs);
-    return toTransfer(row);
+    if (row.eventId) {
+      const eventId = row.eventId;
+      this.options.scheduler.schedule(() => this.deliver(eventId), 0);
+    } else if (scenario !== 'slow') this.options.scheduler.schedule(() => this.settle(id), this.options.settleMs);
+    return toTransfer(row.created);
   }
 
   async getInterestTerms(_accountRef: string): Promise<InterestTerms | null> {
@@ -304,8 +308,11 @@ export class MockBankProvider implements BankPartnerProvider {
     if (Math.abs(nowSeconds - timestamp) > SIGNATURE_TOLERANCE_SECONDS) {
       throw new WebhookVerificationError('Signature timestamp outside tolerance');
     }
-    const expected = hmacHex(this.options.webhookSecret, `${timestamp}.${rawBody}`);
-    if (!safeEqual(expected, parts.v1)) throw new WebhookVerificationError('Signature mismatch');
+    // Accept the current secret, or the previous one during a rotation window.
+    const secrets = [this.options.webhookSecret, this.options.previousWebhookSecret].filter((x): x is string => Boolean(x));
+    if (!secrets.some((secret) => safeEqual(hmacHex(secret, `${timestamp}.${rawBody}`), parts.v1))) {
+      throw new WebhookVerificationError('Signature mismatch');
+    }
 
     let json: unknown;
     try {
@@ -359,19 +366,31 @@ export class MockBankProvider implements BankPartnerProvider {
     return id;
   }
 
-  private changeStatus(transferId: string, to: ProviderTransferStatus, failureReason: string | null, notify: boolean): TransferRow {
+  /**
+   * Moves a transfer from one status to another and records its event.
+   * Conditional on the expected current status, so two processes racing to
+   * settle the same transfer cannot both succeed.
+   */
+  private changeStatus(
+    transferId: string,
+    from: ProviderTransferStatus,
+    to: ProviderTransferStatus,
+    failureReason: string | null,
+    notify: boolean,
+  ): { row: TransferRow; eventId: string } | null {
     return tx(this.db, () => {
-      run(
+      const updated = run(
         this.db,
-        `UPDATE mockbank_transfers SET status = ?, failure_reason = ?, version = version + 1, updated_at = ? WHERE id = ?`,
+        `UPDATE mockbank_transfers SET status = ?, failure_reason = ?, version = version + 1, updated_at = ? WHERE id = ? AND status = ?`,
         to,
         failureReason,
         this.now(),
         transferId,
+        from,
       );
+      if (updated.changes !== 1) return null;
       const row = one<TransferRow>(this.db, 'SELECT * FROM mockbank_transfers WHERE id = ?', transferId)!;
-      this.recordEvent(row, `transfer.${to}`, notify ? 'pending' : 'suppressed');
-      return row;
+      return { row, eventId: this.recordEvent(row, `transfer.${to}`, notify ? 'pending' : 'suppressed') };
     });
   }
 
@@ -379,14 +398,38 @@ export class MockBankProvider implements BankPartnerProvider {
   async settle(transferId: string): Promise<void> {
     const row = one<TransferRow>(this.db, 'SELECT * FROM mockbank_transfers WHERE id = ?', transferId);
     if (!row || row.status !== 'pending') return;
+    let result;
     if (row.scenario === 'decline') {
-      this.changeStatus(transferId, 'failed', 'Declined by the simulated partner (demo scenario).', true);
+      result = this.changeStatus(transferId, 'pending', 'failed', 'Declined by the simulated partner (demo scenario).', true);
     } else if (row.direction === 'payout' && this.balances(row.account_ref).ledger < row.amount_paise) {
-      this.changeStatus(transferId, 'failed', 'Insufficient balance at the partner (simulated).', true);
+      result = this.changeStatus(transferId, 'pending', 'failed', 'Insufficient balance at the partner (simulated).', true);
     } else {
-      this.changeStatus(transferId, 'completed', null, true);
+      result = this.changeStatus(transferId, 'pending', 'completed', null, true);
     }
-    await this.flushPendingEvents();
+    if (result) await this.deliver(result.eventId);
+  }
+
+  /**
+   * Recovery sweep (run by the leader process): settles transfers whose timer
+   * was lost (crash, restart, another worker) and retries stale deliveries.
+   */
+  async sweep(): Promise<{ settled: number; redelivered: number }> {
+    const nowMs = this.options.clock.now().getTime();
+    const overdueBefore = new Date(nowMs - Math.max(this.options.settleMs * 5, 10_000)).toISOString();
+    const overdue = all<{ id: string }>(
+      this.db,
+      `SELECT id FROM mockbank_transfers WHERE status = 'pending' AND scenario <> 'slow' AND created_at < ? ORDER BY created_at LIMIT 200`,
+      overdueBefore,
+    );
+    for (const t of overdue) await this.settle(t.id);
+    const staleBefore = new Date(nowMs - 15_000).toISOString();
+    const stale = all<{ id: string }>(
+      this.db,
+      `SELECT id FROM mockbank_events WHERE delivery_status = 'pending' AND COALESCE(last_attempt_at, created_at) < ? ORDER BY created_at LIMIT 200`,
+      staleBefore,
+    );
+    for (const e of stale) await this.deliver(e.id);
+    return { settled: overdue.length, redelivered: stale.length };
   }
 
   /** Delivers every undelivered event, oldest first. */
@@ -469,18 +512,24 @@ export class MockBankProvider implements BankPartnerProvider {
   /** Confirms transfers created with the "slow" scenario. Returns how many settled. */
   async settleSlowTransfers(): Promise<number> {
     const slow = all<{ id: string }>(this.db, `SELECT id FROM mockbank_transfers WHERE status = 'pending' AND scenario = 'slow'`);
+    let settled = 0;
     for (const t of slow) {
-      this.changeStatus(t.id, 'completed', null, true);
+      const result = this.changeStatus(t.id, 'pending', 'completed', null, true);
+      if (result) {
+        settled++;
+        await this.deliver(result.eventId);
+      }
     }
-    await this.flushPendingEvents();
-    return slow.length;
+    return settled;
   }
 
   /** Reverses a completed transfer but "loses" the webhook, so only reconciliation can find it. */
   reverseWithoutNotice(transferId: string): ProviderTransfer {
     const row = one<TransferRow>(this.db, 'SELECT * FROM mockbank_transfers WHERE id = ?', transferId);
     if (!row || row.status !== 'completed') throw new ProviderError('not_completed', 'Only completed transfers can be reversed');
-    return toTransfer(this.changeStatus(transferId, 'reversed', 'Reversed by the simulated partner (demo drift).', false));
+    const result = this.changeStatus(transferId, 'completed', 'reversed', 'Reversed by the simulated partner (demo drift).', false);
+    if (!result) throw new ProviderError('not_completed', 'Only completed transfers can be reversed');
+    return toTransfer(result.row);
   }
 
   /** Delivers an already-delivered event again, as partners do on retries. */

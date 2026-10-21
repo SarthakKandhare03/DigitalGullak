@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,7 +17,19 @@ export interface AppConfig {
   authHmacSecret: string;
   operatorPasscode: string;
   mockWebhookSecret: string;
+  /** Previous webhook secret, still accepted during a rotation window. */
+  mockWebhookSecretPrevious: string | null;
   mockSettleMs: number;
+  /** Base32 TOTP secret. When set, operator sign-in also needs a 6-digit authenticator code. */
+  operatorTotpSecret: string | null;
+  /** Global per-client request ceiling (per worker process). */
+  rateLimitPerMinute: number;
+  /** Worker processes for `npm start` (cluster mode). */
+  workers: number;
+  /** Background reconciliation interval; 0 disables it. */
+  reconcileIntervalMs: number;
+  /** SQLite commit durability. See openDatabase(). */
+  dbSynchronous: 'normal' | 'full';
   cookieSecure: boolean;
   /** Trust X-Forwarded-* only when behind a known reverse proxy (affects client IPs for rate limits). */
   trustProxy: boolean;
@@ -62,6 +75,16 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, overrides: Part
   const port = Number(env.PORT ?? 8787);
   const settle = Number(env.MOCK_PROVIDER_SETTLE_MS ?? 1800);
   const databasePath = env.DATABASE_PATH ?? './data/gullak.db';
+  const rateLimit = Number(env.RATE_LIMIT_PER_MINUTE ?? 600);
+  const reconcileMinutes = Number(env.RECONCILE_INTERVAL_MINUTES ?? 15);
+  const workers =
+    // 'auto' caps at 4: benchmarks show SQLite's single writer makes more workers slower, not faster.
+    env.WEB_CONCURRENCY === 'auto' ? Math.max(1, Math.min(os.availableParallelism() - 1, 4)) : Math.max(1, Number(env.WEB_CONCURRENCY ?? 1) || 1);
+
+  const totp = env.OPERATOR_TOTP_SECRET?.replace(/\s+/g, '').toUpperCase() || null;
+  if (totp && !/^[A-Z2-7]{16,}=*$/.test(totp)) {
+    throw new ConfigError('OPERATOR_TOTP_SECRET must be a base32 secret of at least 16 characters. Run "npm run ops:totp" to generate one.');
+  }
 
   return {
     env: mode,
@@ -77,7 +100,13 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env, overrides: Part
     authHmacSecret: secret(env, 'AUTH_HMAC_SECRET', mode),
     operatorPasscode: secret(env, 'OPERATOR_PASSCODE', mode),
     mockWebhookSecret: secret(env, 'MOCK_PROVIDER_WEBHOOK_SECRET', mode),
+    mockWebhookSecretPrevious: env.MOCK_PROVIDER_WEBHOOK_SECRET_PREVIOUS || null,
     mockSettleMs: Number.isFinite(settle) && settle >= 0 ? settle : 1800,
+    operatorTotpSecret: totp,
+    rateLimitPerMinute: Number.isInteger(rateLimit) && rateLimit > 0 ? rateLimit : 600,
+    workers,
+    reconcileIntervalMs: Number.isFinite(reconcileMinutes) && reconcileMinutes > 0 ? reconcileMinutes * 60_000 : 0,
+    dbSynchronous: env.DB_SYNCHRONOUS === 'full' ? 'full' : 'normal',
     cookieSecure: env.COOKIE_SECURE === 'true',
     trustProxy: env.TRUST_PROXY === 'true',
     logLevel: env.LOG_LEVEL ?? (mode === 'test' ? 'silent' : 'info'),

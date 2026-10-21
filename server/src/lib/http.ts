@@ -2,14 +2,26 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { z } from 'zod';
 import { badRequest } from './errors';
 
-export const USER_COOKIE = 'gullak_session';
-export const OPERATOR_COOKIE = 'gullak_ops';
+/**
+ * Session cookie names. Over HTTPS the __Host- prefix makes browsers refuse the
+ * cookie unless it is Secure, host-only and Path=/, so a subdomain can never
+ * plant or overwrite it.
+ */
+export function cookieNames(secure: boolean) {
+  return secure ? { user: '__Host-gullak_session', operator: '__Host-gullak_ops' } : { user: 'gullak_session', operator: 'gullak_ops' };
+}
+
+export function clearSessionCookie(reply: FastifyReply, name: string, secure: boolean): void {
+  reply.clearCookie(name, { path: '/', secure, httpOnly: true, sameSite: 'strict' });
+}
 
 declare module 'fastify' {
   interface FastifyRequest {
     rawBody?: string;
     userId: string | null;
     operatorId: string | null;
+    /** Set when the rate-limit key generator already validated the user session for this request. */
+    sessionUserId?: string | null;
   }
 }
 

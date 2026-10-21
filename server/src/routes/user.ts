@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { GOAL_ICONS } from '../../../shared/types';
 import { unauthorized } from '../lib/errors';
-import { USER_COOKIE, parse, userIdOf } from '../lib/http';
+import { clearSessionCookie, cookieNames, parse, userIdOf } from '../lib/http';
 import { requireIdempotencyKey, withIdempotency } from '../lib/idempotency';
 import type { Services } from '../services';
 
@@ -22,10 +22,11 @@ const transferBody = z.object({ amountPaise: paise, demoScenario }).strict();
 
 /** Every route here requires a signed-in user and scopes data to that user. */
 export async function userRoutes(app: FastifyInstance, { services }: { services: Services }) {
-  const { auth, account, goals, ledger, schedules, activity, db, clock, rewards, insights } = services;
+  const { auth, account, goals, ledger, schedules, activity, db, clock, rewards, insights, config } = services;
+  const cookies = cookieNames(config.cookieSecure);
 
   app.addHook('preHandler', async (request) => {
-    const userId = auth.resolveSession(request.cookies[USER_COOKIE], 'user');
+    const userId = request.sessionUserId ?? auth.resolveSession(request.cookies[cookies.user], 'user');
     if (!userId) throw unauthorized();
     request.userId = userId;
   });
@@ -34,12 +35,12 @@ export async function userRoutes(app: FastifyInstance, { services }: { services:
   app.get('/api/me', async (request) => auth.getUser(userIdOf(request)));
 
   app.patch('/api/me', async (request) => {
-    const body = parse(z.object({ displayName: z.string().max(60).nullable() }), request.body);
+    const body = parse(z.object({ displayName: z.string().max(60).nullable() }).strict(), request.body);
     return account.updateProfile(userIdOf(request), body.displayName);
   });
 
   app.post('/api/me/onboarding', async (request) => {
-    const body = parse(z.object({ choice: z.enum(['examples', 'empty']) }), request.body);
+    const body = parse(z.object({ choice: z.enum(['examples', 'empty']) }).strict(), request.body);
     return account.completeOnboarding(userIdOf(request), body.choice);
   });
 
@@ -51,9 +52,9 @@ export async function userRoutes(app: FastifyInstance, { services }: { services:
   app.get('/api/me/closure', async (request) => ({ blockers: account.closureBlockers(userIdOf(request)) }));
 
   app.post('/api/me/close', async (request, reply) => {
-    parse(z.object({ confirm: z.literal(true) }), request.body);
+    parse(z.object({ confirm: z.literal(true) }).strict(), request.body);
     await account.close(userIdOf(request));
-    reply.clearCookie(USER_COOKIE, { path: '/' });
+    clearSessionCookie(reply, cookies.user, config.cookieSecure);
     return { closed: true };
   });
 
@@ -151,7 +152,7 @@ export async function userRoutes(app: FastifyInstance, { services }: { services:
         frequency: z.enum(['daily', 'weekly', 'monthly']),
         startDate: isoDate,
         consent: z.boolean(),
-      }),
+      }).strict(),
       request.body,
     );
     const result = withIdempotency(db, clock, `schedule:${userId}`, key, body, () => schedules.createInTx(userId, body));
@@ -208,7 +209,7 @@ export async function userRoutes(app: FastifyInstance, { services }: { services:
 
   app.post('/api/schedules/:scheduleId/simulate-run', async (request, reply) => {
     const { scheduleId } = parse(z.object({ scheduleId: id }), request.params);
-    const body = parse(z.object({ demoScenario }), request.body ?? {});
+    const body = parse(z.object({ demoScenario }).strict(), request.body ?? {});
     const result = await schedules.simulateNextRun(userIdOf(request), scheduleId, body.demoScenario);
     reply.code(result.transaction.status === 'pending' ? 202 : 200);
     return result;

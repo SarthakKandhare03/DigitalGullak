@@ -2,14 +2,13 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { MAX_SCHEDULE_PAISE, MAX_TARGET_PAISE, MAX_TRANSFER_PAISE, MIN_TRANSFER_PAISE } from '../../../shared/money';
 import type { PublicConfigDTO } from '../../../shared/types';
-import { USER_COOKIE, parse, setSessionCookie } from '../lib/http';
+import { clearSessionCookie, cookieNames, parse, setSessionCookie } from '../lib/http';
 import { WebhookVerificationError } from '../providers/types';
 import type { Services } from '../services';
 
 export async function publicRoutes(app: FastifyInstance, { services }: { services: Services }) {
-  const { auth, config, provider, events, ops } = services;
-
-  app.get('/api/health', async () => ({ ok: true, demoMode: true }));
+  const { auth, config, provider, events, securityEvents } = services;
+  const cookies = cookieNames(config.cookieSecure);
 
   app.get('/api/config', async (): Promise<PublicConfigDTO> => ({
     demoMode: true,
@@ -24,7 +23,7 @@ export async function publicRoutes(app: FastifyInstance, { services }: { service
   }));
 
   app.post('/api/auth/otp/request', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request) => {
-    const body = parse(z.object({ phone: z.string().max(20) }), request.body);
+    const body = parse(z.object({ phone: z.string().max(20) }).strict(), request.body);
     const challenge = auth.requestOtp(body.phone);
     return {
       challengeId: challenge.challengeId,
@@ -37,15 +36,15 @@ export async function publicRoutes(app: FastifyInstance, { services }: { service
   });
 
   app.post('/api/auth/otp/verify', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const body = parse(z.object({ challengeId: z.string().max(100), code: z.string().max(10) }), request.body);
-    const result = await auth.verifyOtp(body.challengeId, body.code.trim());
-    setSessionCookie(reply, USER_COOKIE, result.token, config.cookieSecure, 7 * 24 * 60 * 60);
+    const body = parse(z.object({ challengeId: z.string().max(100), code: z.string().max(10) }).strict(), request.body);
+    const result = await auth.verifyOtp(body.challengeId, body.code.trim(), request.ip);
+    setSessionCookie(reply, cookies.user, result.token, config.cookieSecure, 7 * 24 * 60 * 60);
     return { user: result.user, isNew: result.isNew };
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
-    auth.revokeSession(request.cookies[USER_COOKIE]);
-    reply.clearCookie(USER_COOKIE, { path: '/' });
+    auth.revokeSession(request.cookies[cookies.user]);
+    clearSessionCookie(reply, cookies.user, config.cookieSecure);
     return { ok: true };
   });
 
@@ -62,7 +61,7 @@ export async function publicRoutes(app: FastifyInstance, { services }: { service
       event = provider.verifyAndParseWebhook(request.rawBody ?? '', request.headers);
     } catch (error) {
       if (error instanceof WebhookVerificationError) {
-        ops.rejectedWebhooks++;
+        securityEvents.recordThrottled('webhook_rejected', securityEvents.subjectForIp(request.ip), error.message, 5_000);
         request.log.warn({ reason: error.message }, 'rejected partner webhook');
         return reply.code(401).send({ error: { code: 'invalid_signature', message: 'Webhook verification failed.' } });
       }

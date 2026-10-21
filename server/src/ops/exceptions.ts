@@ -12,7 +12,10 @@ export type ExceptionKind =
   | 'balance_mismatch'
   | 'unmatched_event'
   | 'event_mismatch'
-  | 'event_conflict';
+  | 'event_conflict'
+  | 'ledger_chain_broken'
+  | 'audit_chain_broken'
+  | 'balance_cache_drift';
 
 /** Kinds produced by reconciliation runs (and auto-closed when no longer detected). */
 export const RECONCILIATION_KINDS: ExceptionKind[] = [

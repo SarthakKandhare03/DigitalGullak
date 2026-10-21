@@ -30,6 +30,8 @@ export function migrate(db: DB, log: (msg: string) => void = () => {}): string[]
     if (foreignKeysOff) db.exec('PRAGMA foreign_keys = OFF');
     try {
       tx(db, () => {
+        // Re-check under the write lock in case another process applied it first.
+        if (all(db, 'SELECT 1 FROM schema_migrations WHERE name = ?', file).length) return;
         db.exec(sql);
         if (foreignKeysOff) {
           const violations = all(db, 'PRAGMA foreign_key_check');

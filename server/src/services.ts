@@ -10,8 +10,11 @@ import { RewardsService } from './rewards/rewardsService';
 import { LedgerService } from './ledger/ledgerService';
 import { ProviderAccounts } from './ledger/providerAccounts';
 import type { Clock } from './lib/clock';
+import { AUDIT_CHAIN, HashChain, LEDGER_CHAIN } from './lib/hashChain';
+import { SecurityEvents } from './lib/securityEvents';
 import { AuditLog } from './ops/audit';
 import { ExceptionStore } from './ops/exceptions';
+import { IntegrityService } from './ops/integrity';
 import { OpsService } from './ops/opsService';
 import { ReconciliationService, type ReconciliationOptions } from './ops/reconciliation';
 import { ProviderEventProcessor } from './providers/eventProcessor';
@@ -31,22 +34,30 @@ export function createServices(deps: {
   reconciliation?: ReconciliationOptions;
 }) {
   const { db, config, clock, provider, log } = deps;
+  const securityEvents = new SecurityEvents(db, clock, config.authHmacSecret);
+  const ledgerChain = new HashChain(db, config.authHmacSecret, LEDGER_CHAIN, clock);
+  const auditChain = new HashChain(db, config.authHmacSecret, AUDIT_CHAIN, clock);
   const accounts = new ProviderAccounts(db, provider, clock);
-  const ledger = new LedgerService(db, provider, accounts, clock, log);
+  const ledger = new LedgerService(db, provider, accounts, clock, log, ledgerChain);
   const goals = new GoalService(db, ledger, clock);
   const schedules = new ScheduleService(db, ledger, clock);
   const activity = new ActivityService(db);
-  const auth = new AuthService(db, config, clock, accounts);
+  const auth = new AuthService(db, config, clock, accounts, securityEvents);
   const demo = new DemoDataService(db, provider, accounts, goals, ledger, schedules, clock);
   const account = new AccountService(db, auth, provider, accounts, goals, ledger, schedules, activity, demo, clock);
   const exceptions = new ExceptionStore(db, clock);
-  const audit = new AuditLog(db, clock);
+  const audit = new AuditLog(db, clock, auditChain);
   const events = new ProviderEventProcessor(db, provider, ledger, exceptions, clock);
   const recon = new ReconciliationService(db, provider, ledger, exceptions, audit, clock, deps.reconciliation);
-  const ops = new OpsService(db, provider, ledger, exceptions, recon, audit);
+  const integrity = new IntegrityService(db, ledgerChain, auditChain, exceptions);
+  integrity.sealLegacyRows();
+  const ops = new OpsService(db, provider, ledger, exceptions, recon, audit, securityEvents);
   const rewards = new RewardsService(db, ledger, clock);
   const insights = new InsightsService(db, clock);
-  return { db, config, clock, provider, accounts, ledger, goals, schedules, activity, auth, demo, account, exceptions, audit, events, recon, ops, rewards, insights };
+  return {
+    db, config, clock, provider, accounts, ledger, goals, schedules, activity, auth, demo, account,
+    exceptions, audit, events, recon, ops, rewards, insights, securityEvents, integrity,
+  };
 }
 
 export type Services = ReturnType<typeof createServices>;

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { unauthorized } from '../lib/errors';
-import { OPERATOR_COOKIE, operatorIdOf, parse, setSessionCookie } from '../lib/http';
+import { clearSessionCookie, cookieNames, operatorIdOf, parse, setSessionCookie } from '../lib/http';
 import { toExceptionDTO } from '../ops/exceptions';
 import type { Services } from '../services';
 
@@ -9,24 +9,27 @@ const reason = z.string().min(5, 'Give a reason of at least 5 characters').max(5
 
 /** Operator console API (demo support and reconciliation). */
 export async function opsRoutes(app: FastifyInstance, { services }: { services: Services }) {
-  const { auth, ops, recon, exceptions, audit, config, ledger } = services;
+  const { auth, ops, recon, exceptions, audit, config, ledger, integrity } = services;
+  const cookies = cookieNames(config.cookieSecure);
 
   app.post('/api/ops/session', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const body = parse(z.object({ passcode: z.string().min(1).max(200) }), request.body);
-    const token = auth.operatorSignIn(body.passcode);
-    setSessionCookie(reply, OPERATOR_COOKIE, token, config.cookieSecure, 8 * 60 * 60);
+    const body = parse(z.object({ passcode: z.string().min(1).max(200), code: z.string().max(10).optional() }).strict(), request.body);
+    const token = auth.operatorSignIn(body.passcode, body.code?.trim(), request.ip);
+    setSessionCookie(reply, cookies.operator, token, config.cookieSecure, 8 * 60 * 60);
     return { ok: true };
   });
 
+  app.get('/api/ops/login-options', async () => ({ mfaRequired: auth.operatorMfaRequired }));
+
   app.post('/api/ops/logout', async (request, reply) => {
-    auth.revokeSession(request.cookies[OPERATOR_COOKIE]);
-    reply.clearCookie(OPERATOR_COOKIE, { path: '/' });
+    auth.revokeSession(request.cookies[cookies.operator]);
+    clearSessionCookie(reply, cookies.operator, config.cookieSecure);
     return { ok: true };
   });
 
   app.register(async (scoped) => {
     scoped.addHook('preHandler', async (request) => {
-      const operatorId = auth.resolveSession(request.cookies[OPERATOR_COOKIE], 'operator');
+      const operatorId = auth.resolveSession(request.cookies[cookies.operator], 'operator');
       if (!operatorId) throw unauthorized('Operator sign-in required.');
       request.operatorId = operatorId;
     });
@@ -47,6 +50,9 @@ export async function opsRoutes(app: FastifyInstance, { services }: { services: 
     });
     scoped.get('/api/ops/events', async () => ({ received: ops.providerEvents(), partnerOutbox: ops.mockEvents() }));
     scoped.get('/api/ops/audit', async () => audit.list());
+    scoped.get('/api/ops/security-events', async () => ops.securityLog());
+    // Full (not incremental) re-verification of both hash chains and the balance cache.
+    scoped.post('/api/ops/integrity/verify', { config: { rateLimit: { max: 6, timeWindow: '1 minute' } } }, async () => integrity.verify('full'));
 
     scoped.get('/api/ops/exceptions', async (request) => {
       const query = parse(z.object({ filter: z.enum(['unresolved', 'resolved', 'all']).default('unresolved') }), request.query);
@@ -58,7 +64,7 @@ export async function opsRoutes(app: FastifyInstance, { services }: { services: 
     scoped.post('/api/ops/exceptions/:exceptionId/resolve', async (request) => {
       const { exceptionId } = parse(z.object({ exceptionId: z.string().max(64) }), request.params);
       const body = parse(
-        z.object({ action: z.enum(['apply_partner_status', 'retry_submission', 'escalate', 'mark_resolved']), reason }),
+        z.object({ action: z.enum(['apply_partner_status', 'retry_submission', 'escalate', 'mark_resolved']), reason }).strict(),
         request.body,
       );
       return recon.resolve(operatorIdOf(request), exceptionId, body.action, body.reason);
@@ -66,15 +72,15 @@ export async function opsRoutes(app: FastifyInstance, { services }: { services: 
 
     // --- Demo tools (mock partner only; every use is audited) -------------
     scoped.post('/api/ops/demo/replay-event', async (request) => {
-      const body = parse(z.object({ eventId: z.string().max(64), reason }), request.body);
+      const body = parse(z.object({ eventId: z.string().max(64), reason }).strict(), request.body);
       return ops.replayEvent(operatorIdOf(request), body.eventId, body.reason);
     });
     scoped.post('/api/ops/demo/settle-slow', async (request) => {
-      const body = parse(z.object({ reason }), request.body);
+      const body = parse(z.object({ reason }).strict(), request.body);
       return ops.settleSlowTransfers(operatorIdOf(request), body.reason);
     });
     scoped.post('/api/ops/demo/missed-reversal', async (request) => {
-      const body = parse(z.object({ transactionId: z.string().max(64), reason }), request.body);
+      const body = parse(z.object({ transactionId: z.string().max(64), reason }).strict(), request.body);
       return ops.simulateMissedReversal(operatorIdOf(request), body.transactionId, body.reason);
     });
   });

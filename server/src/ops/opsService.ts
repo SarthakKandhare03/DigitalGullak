@@ -7,12 +7,10 @@ import type { BankPartnerProvider } from '../providers/types';
 import type { AuditLog } from './audit';
 import type { ExceptionStore } from './exceptions';
 import type { ReconciliationService } from './reconciliation';
+import type { SecurityEvents } from '../lib/securityEvents';
 
 /** Read models and demo tools for the operator console. Customer PII is limited to the last 4 phone digits. */
 export class OpsService {
-  /** Webhook requests rejected before storage (bad signature/timestamp). In-memory, demo only. */
-  rejectedWebhooks = 0;
-
   constructor(
     private readonly db: DB,
     private readonly provider: BankPartnerProvider,
@@ -20,6 +18,7 @@ export class OpsService {
     private readonly exceptions: ExceptionStore,
     private readonly recon: ReconciliationService,
     private readonly audit: AuditLog,
+    private readonly securityEvents: SecurityEvents,
   ) {}
 
   overview() {
@@ -28,6 +27,7 @@ export class OpsService {
       this.db,
       'SELECT processing_status, COUNT(*) AS n, SUM(delivery_count) AS deliveries FROM provider_events GROUP BY processing_status',
     );
+    const security = this.securityEvents.summary();
     return {
       users: count(`SELECT COUNT(*) AS n FROM users WHERE status = 'active'`),
       pendingTransactions: count(`SELECT COUNT(*) AS n FROM transactions WHERE status = 'pending'`),
@@ -35,10 +35,18 @@ export class OpsService {
       unresolvedExceptions: this.exceptions.countUnresolved(),
       providerEvents: Object.fromEntries(events.map((e) => [e.processing_status, e.n])),
       duplicateDeliveries: events.reduce((sum, e) => sum + (e.deliveries - e.n), 0),
-      rejectedWebhooks: this.rejectedWebhooks,
+      rejectedWebhooks: security.webhook_rejected ?? 0,
+      securityEvents24h: security,
+      integrity: all<{ chain: string; last_rowid: number; verified_at: string }>(this.db, 'SELECT chain, last_rowid, verified_at FROM integrity_checkpoints').map(
+        (c) => ({ chain: c.chain, verifiedThroughRow: c.last_rowid, verifiedAt: c.verified_at }),
+      ),
       lastReconciliation: this.recon.lastRun(),
       provider: { id: this.provider.id, displayName: this.provider.displayName, simulated: this.provider.isSimulated },
     };
+  }
+
+  securityLog() {
+    return this.securityEvents.recent(100);
   }
 
   users() {

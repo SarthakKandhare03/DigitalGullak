@@ -7,3 +7,5 @@ test-results/
 playwright-report/
 e2e/.artifacts/
 *.log
+data/bench.db*
+docs/benchmarks/*.tmp.json

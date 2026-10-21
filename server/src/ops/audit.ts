@@ -2,6 +2,7 @@ import { all, run, type DB } from '../db/db';
 import { nowIso, type Clock } from '../lib/clock';
 import { newId } from '../lib/crypto';
 import { badRequest } from '../lib/errors';
+import type { HashChain } from '../lib/hashChain';
 
 export interface AuditEntryDTO {
   id: string;
@@ -27,11 +28,15 @@ interface AuditRow {
   created_at: string;
 }
 
-/** Append-only record of every operator action. Callers write it in the same DB transaction as the change. */
+/**
+ * Append-only, hash-chained record of every operator action. Callers write it
+ * in the same DB transaction as the change it describes.
+ */
 export class AuditLog {
   constructor(
     private readonly db: DB,
     private readonly clock: Clock,
+    private readonly chain: HashChain,
   ) {}
 
   record(entry: {
@@ -46,7 +51,7 @@ export class AuditLog {
     const reason = entry.reason.trim();
     if (reason.length < 5) throw badRequest('reason_required', 'Give a reason of at least 5 characters for the audit log.');
     const id = newId('aud');
-    run(
+    const inserted = run(
       this.db,
       `INSERT INTO operator_audit_log (id, operator_id, action, target_type, target_id, reason, before_json, after_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -60,6 +65,7 @@ export class AuditLog {
       entry.after === undefined ? null : JSON.stringify(entry.after),
       nowIso(this.clock),
     );
+    this.chain.seal(inserted.lastInsertRowid);
     return id;
   }
 
