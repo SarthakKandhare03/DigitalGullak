@@ -50,7 +50,9 @@ export const useTransaction = (id: string | undefined) =>
     queryKey: keys.transaction(id ?? ''),
     queryFn: () => api<TransactionDetailDTO>(`/api/transactions/${id}`),
     enabled: Boolean(id),
-    refetchInterval: (query) => (query.state.data?.status === 'pending' ? 1000 : false),
+    // Back off 1s → 1.5s → 2.25s … capped at 5s, so slow transfers don't hammer the server.
+    refetchInterval: (query) =>
+      query.state.data?.status === 'pending' ? Math.min(5_000, Math.round(1_000 * 1.5 ** Math.max(0, query.state.dataUpdateCount - 1))) : false,
   });
 
 function activityUrl(filters: ActivityFilters, limit: number, before?: string): string {

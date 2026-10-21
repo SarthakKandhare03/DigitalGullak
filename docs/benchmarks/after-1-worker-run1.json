@@ -1,0 +1,53 @@
+{
+  "when": "2026-10-21T17:53:56.151Z",
+  "workers": "1",
+  "seconds": 8,
+  "connections": 50,
+  "rows": [
+    {
+      "scenario": "GET /api/health",
+      "reqPerSec": 5759,
+      "p50ms": 6,
+      "p99ms": 35,
+      "total": 46070,
+      "non2xx": 0,
+      "errors": 0
+    },
+    {
+      "scenario": "GET /api/dashboard",
+      "reqPerSec": 520,
+      "p50ms": 85,
+      "p99ms": 260,
+      "total": 4162,
+      "non2xx": 0,
+      "errors": 0
+    },
+    {
+      "scenario": "GET /api/rewards",
+      "reqPerSec": 494,
+      "p50ms": 88,
+      "p99ms": 273,
+      "total": 3950,
+      "non2xx": 0,
+      "errors": 0
+    },
+    {
+      "scenario": "GET /api/activity",
+      "reqPerSec": 575,
+      "p50ms": 79,
+      "p99ms": 220,
+      "total": 4599,
+      "non2xx": 0,
+      "errors": 0
+    },
+    {
+      "scenario": "POST contribution (write)",
+      "reqPerSec": 154,
+      "p50ms": 336,
+      "p99ms": 580,
+      "total": 1228,
+      "non2xx": 0,
+      "errors": 0
+    }
+  ]
+}

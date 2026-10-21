@@ -58,7 +58,7 @@ The UI never shows success until the partner's confirmation has been applied. It
   - lowering `provider_version`
 
   Corrections are new ledger rows (`entry_type = 'reversal'`), never edits.
-- **Balances are derived** from `ledger_entries`, never stored as mutable numbers.
+- **Balances come from the ledger.** `goal_balances` is a cache maintained by a trigger in the same transaction as each ledger insert, and a background integrity check proves it still equals `SUM(ledger_entries)`.
 - **Idempotency** works at three levels:
   - Client keys on create and transfer endpoints.
   - Deterministic keys for schedule runs (`schedule:<id>:<date>`).
@@ -153,38 +153,80 @@ Production hardening that this demo leaves out:
 
 ## 8. Security hardening
 
-- **Sessions:** cookies are httpOnly and SameSite=Strict (Secure when `COOKIE_SECURE=true`). The server stores only the SHA-256 hash of the token. Sessions expire after 30 minutes of inactivity, with an absolute limit of 7 days for users and 8 hours for operators. Each user can have at most 5 active sessions; signing out revokes the session on the server.
+- **Sessions:**
+  - Cookies are httpOnly and SameSite=Strict. With `COOKIE_SECURE=true` they are also Secure and use the `__Host-` prefix, so a subdomain cannot plant or overwrite them.
+  - The server stores only the SHA-256 hash of each token.
+  - Sessions expire after **30 minutes idle for users and 15 for operators**, with absolute limits of 7 days and 8 hours.
+  - At most 5 active sessions per subject. Signing out revokes the session on the server.
+- **Operator sign-in:**
+  - The passcode can be combined with an optional **TOTP** (RFC 6238, SHA-1, 6 digits, ±1 step for clock drift). Run `npm run ops:totp` to set it up.
+  - Each code works once: the last accepted time step is stored, so a replayed code is refused and logged.
+  - Failures are recorded as security events, so the **lockout** (5 per IP or 30 in total within 15 minutes) holds across restarts and worker processes.
 - **CSRF:**
   - SameSite=Strict cookies
   - JSON-only bodies (any other content type gets a 415)
   - an Origin allow-list (`APP_ORIGINS`)
-  - Fetch Metadata: requests marked `Sec-Fetch-Site: cross-site` are refused
-- **Rate limits:** per IP, using `@fastify/rate-limit`.
-  - 600 requests per minute globally
-  - OTP request: 10 per minute; OTP verify: 20 per minute
-  - operator sign-in: 10 per minute
-  - games and claims: 30 per minute
-
-  These sit on top of the per-phone OTP limits and the operator lockout. Signed partner webhooks are exempt from rate limits.
+  - Fetch Metadata: requests marked `Sec-Fetch-Site: cross-site` are refused and logged
+- **Rate limits:**
+  - Signed-in users are counted **per account**, everyone else **per IP**. Carrier-grade NAT puts thousands of Indian mobile users behind a single IP, so per-account keys stop one heavy user from throttling everyone on the same network.
+  - Route-level limits: OTP request 10/min, OTP verify 20/min, operator sign-in 10/min, games and claims 30/min, full integrity verification 6/min.
+  - These sit on top of the per-phone OTP limits stored in the database.
+  - Signed partner webhooks are exempt.
+  - The counters are kept in memory per worker. For multi-host deployments, plug a shared store (for example Redis) into `@fastify/rate-limit`.
+- **Security events:** failed and locked sign-ins, replayed TOTP codes, failed OTPs, rate-limit hits, blocked cross-site requests and rejected webhooks are written to `security_events`. Subjects are keyed hashes of IPs, never the raw addresses. Floods are de-duplicated (one row per type and subject per window) so an attack can't amplify into database writes. The events appear in the operator console's Security tab.
+- **Tamper-evident hash chains** (`server/src/lib/hashChain.ts`):
+  - Every `ledger_entries` and `operator_audit_log` row stores `prev_hash` and `row_hash = HMAC(key, [prev_hash, …fields])`. It is sealed inside the same write transaction that inserts the row.
+  - The key is derived from `AUTH_HMAC_SECRET`, which lives outside the database. Someone who edits the file directly, even after dropping the append-only triggers, cannot produce a valid chain.
+  - An incremental check of the new rows runs every minute. A full check is available as **Run full verification** in the console (`POST /api/ops/integrity/verify`).
+  - Rows written before the chains existed were sealed once, at the first start after the upgrade.
+  - Rotating `AUTH_HMAC_SECRET` breaks verification of existing rows, so a rotation must re-anchor the chains.
 - **Headers:**
-  - a strict CSP: no inline scripts, no third-party origins, `frame-ancestors 'none'`
+  - a strict CSP with no inline scripts and no third-party origins: `frame-ancestors 'none'`, plus `upgrade-insecure-requests` over HTTPS
   - X-Frame-Options DENY, nosniff and Referrer-Policy: no-referrer
   - Permissions-Policy, COOP and CORP
-  - HSTS when the app is served over HTTPS
-  - an `X-Request-Id` on every response for support tracing
+  - HSTS over HTTPS
+  - `X-Request-Id` on every response
   - `Cache-Control: no-store` on every API response
-- **Input:** Zod validation everywhere, with strict schemas that reject unknown fields on money and reward endpoints. Request bodies are capped at 64 KB. Unknown or another user's resources return 404.
-- **Secrets and logs:** secrets come only from the environment. The server refuses placeholder values. Cookies, signatures and OTP codes are never logged.
-- **Data integrity:** the following tables are append-only, enforced by database triggers:
+- **Timeouts:** headers within 20 s, the whole request within 30 s, a 30 s idle socket timeout, and a 65 s keep-alive (longer than typical load-balancer idle timeouts). These protect against slow-client (slowloris) attacks.
+- **Input:** Zod validation with **strict schemas on every request body**, so unknown fields are rejected and mass assignment is impossible. Bodies are capped at 64 KB. Unknown resources, and other users' resources, return 404.
+- **Webhooks:** HMAC-SHA256 over the raw body with a 5-minute window and constant-time comparison. `MOCK_PROVIDER_WEBHOOK_SECRET_PREVIOUS` is still accepted during a **key rotation**.
+- **Secrets and logs:** secrets come only from the environment, and placeholder values are refused. Cookies, signatures and OTP codes are never logged. Each request is logged once, by route pattern, so IDs and query strings stay out of the logs.
+- **Retention** (leader job, every 10 minutes): removes OTP challenges after 1 day, expired or revoked sessions after 7 days, idempotency records after 7 days (money movements stay idempotent forever because their keys live on the transactions), security events after 90 days, and abandoned game sessions after 2 days. Financial records are never deleted.
+- **Append-only tables,** enforced by database triggers:
   - transactions
   - transaction events
   - ledger entries
   - schedule events
   - reward points
   - the operator audit log
-- **Performance:**
-  - lazy-loaded routes, with the vendor code (React, TanStack Query) split into long-cached chunks
-  - immutable caching for hashed assets
-  - Brotli/gzip compression
-  - batched goal-balance queries
-  - covering indexes for history and points queries
+
+## 9. Scaling and operations
+
+- **Process model** (`server/src/index.ts`): with `WEB_CONCURRENCY=N` (or `auto`, which means cores − 1, capped at 4), a primary process applies migrations once, then forks N workers that share the port and the SQLite database file (WAL mode).
+  - Worker 0 is the **leader** and is the only one that runs background jobs.
+  - Crashed workers are re-forked with crash-loop back-off and keep their slot, so a restarted worker 0 is still the leader.
+  - On SIGINT, SIGTERM or an IPC `shutdown` message, each worker marks itself as draining (readiness returns 503), stops its jobs, finishes in-flight requests and closes the database.
+- **Correctness across processes:**
+  - Each `tx()` runs `BEGIN IMMEDIATE`, which takes SQLite's write lock up front, so check-then-write logic stays atomic between processes as well as within one.
+  - Mock partner settlement is a conditional update (`WHERE status = 'pending'`), so two processes can never both settle a transfer.
+  - The migration runner re-checks inside its transaction.
+- **Background jobs** (leader only):
+  - a **partner recovery sweep** every 15 seconds: settles transfers whose timer was lost to a crash or restart, and retries stale webhook deliveries
+  - an incremental **integrity check** every minute
+  - **retention and `PRAGMA optimize` / WAL checkpoint** every 10 minutes
+  - **reconciliation** every `RECONCILE_INTERVAL_MINUTES` (default 15; 0 turns it off)
+- **Database tuning:**
+  - WAL mode, `synchronous=NORMAL` (configurable with `DB_SYNCHRONOUS`; use `full` for real money), a 32 MB cache, 256 MB of memory-mapped reads, in-memory temp storage, and a capped WAL size
+  - posted balances cached in `goal_balances` by an `AFTER INSERT` trigger on the ledger, in the same transaction, and verified against the ledger by the integrity job
+  - partial indexes for pending transfers, undelivered events and rows not yet sealed into a chain
+- **HTTP:**
+  - API JSON is gzip-compressed synchronously at level 6, which is about 3.5× cheaper than Brotli for these payload sizes.
+  - Static assets are pre-compressed at build time (Brotli q11 + gzip 9) and cached immutably.
+  - Route chunks are lazy-loaded and vendor chunks are long-cached.
+  - Pending transfers are polled with back-off (1 s → 5 s).
+- **Health checks:** `/api/health` reports liveness and `/api/health/ready` reports readiness (database reachable and not draining).
+- **Measured results** are in [`docs/benchmarks`](benchmarks/README.md). With 4 workers reads reach about 2.7× the original throughput, and writes about 2.9× (with 1 worker).
+- **Where SQLite stops:** there is one writer per database. More workers scale reads but not writes, and under write-heavy load they add lock contention. The next step is PostgreSQL:
+  - the SQL lives in small service classes, so moving means swapping the query helpers in `server/src/db/db.ts` and converting `tx()` to async
+  - rate-limit counters would move to a shared store
+  - the leader election would move to a database lease

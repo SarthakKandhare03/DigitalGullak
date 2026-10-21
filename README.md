@@ -16,12 +16,12 @@ Goal pockets · a ledger built like a bank partner integration · rewards, games
 ![SQLite](https://img.shields.io/badge/SQLite-node%3Asqlite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ![Vite](https://img.shields.io/badge/Vite-7-646CFF?style=for-the-badge&logo=vite&logoColor=white)
 <br />
-![Tests](https://img.shields.io/badge/tests-42%20API%20%2B%206%20E2E%20passing-57d394?style=for-the-badge)
+![Tests](https://img.shields.io/badge/tests-57%20API%20%2B%206%20E2E%20passing-57d394?style=for-the-badge)
 ![npm audit](https://img.shields.io/badge/npm%20audit-0%20vulnerabilities-57d394?style=for-the-badge)
 ![Money](https://img.shields.io/badge/money-simulated%20only-ecc677?style=for-the-badge)
 ![Made in India](https://img.shields.io/badge/made%20for-India%20%F0%9F%87%AE%F0%9F%87%B3-ff9933?style=for-the-badge)
 
-[**Screenshots**](#-screenshots) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**Architecture**](#-architecture) · [**Rewards**](#-gullak-rewards) · [**Security**](#-security) · [**Roadmap**](#-road-to-live-money)
+[**Screenshots**](#-screenshots) · [**Quick start**](#-quick-start) · [**Features**](#-features) · [**Architecture**](#-architecture) · [**Rewards**](#-gullak-rewards) · [**Security**](#-security) · [**Performance**](#-performance--scaling) · [**Roadmap**](#-road-to-live-money)
 
 </div>
 
@@ -114,8 +114,10 @@ The **OTP appears on screen**; no SMS is ever sent.
 | Command | What it does |
 |---|---|
 | `npm run dev` | API (tsx watch) + Vite dev server with an `/api` proxy |
-| `npm run build && npm start` | Production build served on a single port (`:8787`) |
-| `npm test` | 42 Vitest tests: money maths, ledger, idempotency, ownership, webhooks, reconciliation, rewards, security |
+| `npm run build && npm start` | Production build (assets pre-compressed) served on a single port (`:8787`). Add `WEB_CONCURRENCY=4` for cluster mode |
+| `npm test` | 57 Vitest tests: money maths, ledger, idempotency, ownership, webhooks, reconciliation, rewards, security, scaling |
+| `npm run bench` | Load benchmark (seeds users, starts the server, runs autocannon). `WEB_CONCURRENCY=4 npm run bench` for cluster mode |
+| `npm run ops:totp` | Generate an operator MFA secret and an authenticator-app link |
 | `npm run e2e` | Playwright end-to-end tests on mobile and desktop, using your installed Edge (`E2E_CHANNEL=chrome` for Chrome) |
 | `npm run typecheck` | Strict TypeScript across server, shared code and web |
 | `npm run db:migrate` / `db:seed` / `db:reset` | Database management |
@@ -245,15 +247,37 @@ sequenceDiagram
 ## 🔐 Security
 
 <table>
-<tr><td>🍪 <b>Sessions</b></td><td>httpOnly + SameSite=Strict cookies, only the hash of the token is stored, a 30-minute idle timeout and at most 5 sessions per user</td></tr>
+<tr><td>🔗 <b>Tamper-evident ledger</b></td><td>Ledger entries and the operator audit log are <b>HMAC hash-chained</b>. Editing, deleting or inserting a row, even with database triggers dropped, fails verification. The chains are checked incrementally every minute, and in full on demand from the operator console.</td></tr>
+<tr><td>🔐 <b>Operator MFA</b></td><td>Optional TOTP (RFC 6238) on top of the passcode: <code>npm run ops:totp</code>. Each code works only once. The lockout is stored in the database (5 failures per IP or 30 in total within 15 minutes), so it holds across restarts and worker processes.</td></tr>
+<tr><td>🍪 <b>Sessions</b></td><td>httpOnly + SameSite=Strict cookies, with the <code>__Host-</code> prefix over HTTPS. Only the hash of the token is stored. Sessions expire after 30 minutes idle for users and 15 for operators, with at most 5 sessions each.</td></tr>
 <tr><td>🧱 <b>CSRF</b></td><td>SameSite=Strict, JSON-only bodies, an Origin allow-list, and Fetch Metadata (<code>Sec-Fetch-Site: cross-site</code> is refused)</td></tr>
-<tr><td>🚦 <b>Rate limits</b></td><td>600 requests/min per IP overall · 10/min for OTP requests · 10/min for operator sign-in · 30/min for games and claims · plus limits per phone number</td></tr>
-<tr><td>📜 <b>Headers</b></td><td>A strict CSP (no inline scripts, <code>frame-ancestors 'none'</code>), COOP/CORP, Permissions-Policy, HSTS over HTTPS, <code>X-Request-Id</code></td></tr>
-<tr><td>✅ <b>Input</b></td><td>Zod validation with strict schemas (unknown fields rejected) and a 64 KB body limit</td></tr>
-<tr><td>✍️ <b>Webhooks</b></td><td>HMAC-SHA256 over the raw body with a 5-minute timestamp window, constant-time comparison, de-duplication by event id, and stale or out-of-order events rejected by version</td></tr>
-<tr><td>🙈 <b>Privacy</b></td><td>Phone numbers are stored only as an HMAC plus the last 4 digits. No IDs, no bank details. Users can export their data. Secrets are never logged.</td></tr>
+<tr><td>🚦 <b>Rate limits</b></td><td><b>Per account</b> for signed-in users, so carrier-grade NAT doesn't punish whole networks, and per IP otherwise · OTP 10/min · operator sign-in 10/min · games 30/min · plus limits per phone number</td></tr>
+<tr><td>🚨 <b>Security events</b></td><td>Failed sign-ins, replayed codes, lockouts, rate-limit hits, blocked cross-site requests and rejected webhooks go into a shared table (IP addresses stored only as keyed hashes) and appear in the operator console</td></tr>
+<tr><td>📜 <b>Headers</b></td><td>A strict CSP (no inline scripts, <code>frame-ancestors 'none'</code>, <code>upgrade-insecure-requests</code> over HTTPS), COOP/CORP, Permissions-Policy, HSTS, <code>X-Request-Id</code></td></tr>
+<tr><td>⏱️ <b>Timeouts</b></td><td>Header, request and connection timeouts protect against slow-client (slowloris) attacks</td></tr>
+<tr><td>✅ <b>Input</b></td><td>Zod validation with <b>strict schemas on every request body</b> (unknown fields rejected) and a 64 KB body limit</td></tr>
+<tr><td>✍️ <b>Webhooks</b></td><td>HMAC-SHA256 over the raw body with a 5-minute window, constant-time comparison, de-duplication by event id, and stale or out-of-order events rejected by version. A previous secret is accepted during a <b>key rotation</b>.</td></tr>
+<tr><td>🙈 <b>Privacy</b></td><td>Phone numbers are stored only as an HMAC plus the last 4 digits. A <b>retention job</b> purges old OTPs, sessions, idempotency records and security events. Financial records are never deleted.</td></tr>
 <tr><td>📦 <b>Supply chain</b></td><td><code>npm audit</code>: 0 vulnerabilities</td></tr>
 </table>
+
+---
+
+## 📈 Performance & scaling
+
+Same-machine before/after benchmarks (`npm run bench`, 50 connections, with compression like a browser). Full method and raw data: [`docs/benchmarks`](docs/benchmarks/README.md).
+
+| Requests/s | Before | After (1 worker) | After (4 workers) |
+|---|---:|---:|---:|
+| Dashboard | 386 | 519 | **1,046** (2.7×) |
+| Rewards | 416 | 527 | **1,189** (2.9×) |
+| Activity | 546 | 605 | **1,121** (2.1×) |
+| Deposit (write) | 54 | **155** (2.9×) | 117 |
+
+- **Cluster mode:** `WEB_CONCURRENCY=4 npm start` runs a primary process that migrates the database once and forks workers that share the port. Crashed workers restart automatically, and shutdown drains in-flight requests first. Background jobs run only on the leader: partner recovery sweep, integrity checks, retention, reconciliation.
+- **Health checks:** `/api/health` (liveness) and `/api/health/ready` (readiness; returns 503 while draining) for load balancers.
+- **Faster paths:** a cached balance per goal maintained by a trigger, a read-only rewards summary, synchronous gzip for API JSON, static assets pre-compressed at build time, and backed-off polling.
+- **Honest limit:** SQLite has a single writer. More workers scale **reads**, not writes. Beyond a few hundred writes per second, move to PostgreSQL; the schema and the SQL layer are written to make that straightforward.
 
 ---
 
@@ -263,6 +287,10 @@ sequenceDiagram
 ✓ shared/money.test.ts     11 tests  (₹ formatting, lakh/crore words, IST schedules)
 ✓ server/test/api.test.ts  19 tests  (auth, idempotency, ownership, immutability, webhooks, reconciliation)
 ✓ server/test/rewards.test 12 tests  (quests, quiz, anti-cheat, redemption refunds, security headers, rate limits)
+✓ server/test/scale-security.test.ts
+                           15 tests  (hash-chain tamper detection, balance cache, TOTP + replay, persistent
+                                      lockout across processes, __Host- cookies, key rotation, crash recovery,
+                                      per-account rate limits, gzip, readiness, data retention)
 ✓ e2e (Playwright)          6 tests  (every main flow on Pixel 7 + desktop, incl. a full Coin Catch round)
 ```
 

@@ -1,51 +1,51 @@
 {
-  "when": "2026-10-21T17:31:13.503Z",
+  "when": "2026-10-21T17:54:47.182Z",
   "workers": "1",
   "seconds": 8,
   "connections": 50,
   "rows": [
     {
       "scenario": "GET /api/health",
-      "reqPerSec": 16965,
-      "p50ms": 2,
-      "p99ms": 7,
-      "total": 135697,
+      "reqPerSec": 4923,
+      "p50ms": 8,
+      "p99ms": 34,
+      "total": 39378,
       "non2xx": 0,
       "errors": 0
     },
     {
       "scenario": "GET /api/dashboard",
-      "reqPerSec": 880,
-      "p50ms": 56,
-      "p99ms": 103,
-      "total": 7043,
+      "reqPerSec": 343,
+      "p50ms": 125,
+      "p99ms": 380,
+      "total": 2744,
       "non2xx": 0,
       "errors": 0
     },
     {
       "scenario": "GET /api/rewards",
-      "reqPerSec": 1154,
-      "p50ms": 40,
-      "p99ms": 89,
-      "total": 9232,
+      "reqPerSec": 438,
+      "p50ms": 105,
+      "p99ms": 293,
+      "total": 3503,
       "non2xx": 0,
       "errors": 0
     },
     {
       "scenario": "GET /api/activity",
-      "reqPerSec": 1066,
-      "p50ms": 45,
-      "p99ms": 76,
-      "total": 8524,
+      "reqPerSec": 560,
+      "p50ms": 79,
+      "p99ms": 234,
+      "total": 4477,
       "non2xx": 0,
       "errors": 0
     },
     {
       "scenario": "POST contribution (write)",
-      "reqPerSec": 270,
-      "p50ms": 155,
-      "p99ms": 661,
-      "total": 2157,
+      "reqPerSec": 55,
+      "p50ms": 762,
+      "p99ms": 1963,
+      "total": 442,
       "non2xx": 0,
       "errors": 0
     }

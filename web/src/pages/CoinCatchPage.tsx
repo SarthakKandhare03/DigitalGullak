@@ -127,6 +127,7 @@ export function CoinCatchPage() {
     glow: 0,
     frame: 0,
     last: 0,
+    lastHud: 0,
   });
 
   const start = useMutation({ mutationFn: () => api<CoinCatchStartDTO>('/api/rewards/coin-catch/start', { method: 'POST' }) });
@@ -216,7 +217,11 @@ export function CoinCatchPage() {
       ctx.globalAlpha = 1;
     }
 
-    setTimeLeft(Math.max(0, COIN_CATCH.durationMs - elapsed));
+    // The canvas redraws every frame; React only re-renders the HUD ~10 times a second.
+    if (now - g.lastHud > 100) {
+      g.lastHud = now;
+      setTimeLeft(Math.max(0, COIN_CATCH.durationMs - elapsed));
+    }
     if (elapsed >= COIN_CATCH.durationMs) {
       setPhase('submitting');
       finish.mutate({ sessionId: g.session!.sessionId, caught: g.caught });

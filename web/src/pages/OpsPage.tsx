@@ -16,6 +16,8 @@ interface Overview {
   providerEvents: Record<string, number>;
   duplicateDeliveries: number;
   rejectedWebhooks: number;
+  securityEvents24h: Record<string, number>;
+  integrity: Array<{ chain: string; verifiedThroughRow: number; verifiedAt: string }>;
   lastReconciliation: { finishedAt: string; triggeredBy: string; accountsChecked: number; transfersChecked: number; exceptionsOpened: number; exceptionsClosed: number } | null;
   provider: { displayName: string; simulated: boolean };
 }
@@ -36,6 +38,8 @@ interface EventsResponse {
   received: Array<{ id: number; eventId: string; type: string; transferRef: string | null; reference: string | null; processingStatus: string; processingNote: string | null; deliveryCount: number; receivedAt: string }>;
   partnerOutbox: Array<{ id: string; type: string; transferId: string | null; deliveryStatus: string; attempts: number; lastResponseStatus: number | null; createdAt: string }>;
 }
+interface ChainResult { chain: string; ok: boolean; checked: number; brokenAt: number | null; reason: string | null }
+interface IntegrityReport { ledger: ChainResult; audit: ChainResult; balanceCache: { ok: boolean; driftedGoals: unknown[] } }
 interface AuditItem { id: string; operatorId: string; action: string; targetType: string; targetId: string; reason: string; before: unknown; after: unknown; createdAt: string }
 interface UserItem { id: string; phoneLast4: string; displayName: string | null; status: string; createdAt: string; totals: BalanceDTO }
 
@@ -50,6 +54,9 @@ const KIND_HELP: Record<string, string> = {
   unmatched_event: 'Partner event did not match any transaction.',
   event_mismatch: 'Partner event details did not match the journal.',
   event_conflict: 'Partner event conflicts with the journal state.',
+  ledger_chain_broken: 'The ledger hash chain failed verification — a row was edited, removed or inserted outside the app.',
+  audit_chain_broken: 'The operator audit-log hash chain failed verification.',
+  balance_cache_drift: 'A cached goal balance no longer matches the sum of its ledger entries.',
 };
 
 type Action = { title: string; description: ReactNode; confirm: string; run: (reason: string) => Promise<unknown> };
@@ -62,7 +69,7 @@ export function OpsPage() {
   useDocumentTitle('Operator console');
   const queryClient = useQueryClient();
   const overview = useOps<Overview>('overview', '/api/ops/overview');
-  const [tab, setTab] = useState<'exceptions' | 'transactions' | 'events' | 'users' | 'audit'>('exceptions');
+  const [tab, setTab] = useState<'exceptions' | 'transactions' | 'events' | 'users' | 'audit' | 'security'>('exceptions');
   const [action, setAction] = useState<Action | null>(null);
   const [reason, setReason] = useState('');
   const [flash, setFlash] = useState<string | null>(null);
@@ -73,6 +80,17 @@ export function OpsPage() {
   const events = useOps<EventsResponse>('events', '/api/ops/events', !unauthenticated && tab === 'events');
   const users = useOps<UserItem[]>('users', '/api/ops/users', !unauthenticated && tab === 'users');
   const audit = useOps<AuditItem[]>('audit', '/api/ops/audit', !unauthenticated && tab === 'audit');
+  const security = useOps<Array<{ id: number; type: string; subject: string | null; detail: string | null; createdAt: string }>>(
+    'security',
+    '/api/ops/security-events',
+    !unauthenticated && tab === 'security',
+  );
+  const verifyIntegrity = useMutation({
+    mutationFn: () => api<IntegrityReport>('/api/ops/integrity/verify', { method: 'POST' }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['ops'] });
+    },
+  });
 
   const runAction = useMutation({
     mutationFn: ({ act, why }: { act: Action; why: string }) => act.run(why),
@@ -142,12 +160,46 @@ export function OpsPage() {
             <Kpi label="Open exceptions" value={overview.data.unresolvedExceptions} />
             <Kpi label="Duplicate webhooks absorbed" value={overview.data.duplicateDeliveries} />
             <Kpi label="Rejected webhooks" value={overview.data.rejectedWebhooks} />
+            <Kpi label="Security events (24h)" value={Object.values(overview.data.securityEvents24h).reduce((a, b) => a + b, 0)} />
           </dl>
         ) : overview.isError ? (
           <Notice tone="error">{errorMessage(overview.error)}</Notice>
         ) : (
           <p role="status">Loading…</p>
         )}
+
+        <section className="card stack" aria-labelledby="integrity-title">
+          <div className="row-between">
+            <div>
+              <h2 id="integrity-title" style={{ margin: 0 }}>
+                Ledger integrity
+              </h2>
+              <p className="small muted" style={{ margin: 0 }}>
+                The ledger and audit log are HMAC hash-chained. Background checks verify new rows every minute; a full check re-verifies
+                everything.
+                {overview.data?.integrity.length
+                  ? ` Last verified: ${overview.data.integrity.map((c) => `${c.chain} through row ${c.verifiedThroughRow} (${formatDateTimeIN(c.verifiedAt)})`).join(' · ')}.`
+                  : ''}
+              </p>
+            </div>
+            <button type="button" className="btn btn--secondary" onClick={() => verifyIntegrity.mutate()} disabled={verifyIntegrity.isPending}>
+              {verifyIntegrity.isPending ? 'Verifying…' : 'Run full verification'}
+            </button>
+          </div>
+          {verifyIntegrity.data ? (
+            <Notice
+              tone={verifyIntegrity.data.ledger.ok && verifyIntegrity.data.audit.ok && verifyIntegrity.data.balanceCache.ok ? 'ok' : 'error'}
+              title={verifyIntegrity.data.ledger.ok && verifyIntegrity.data.audit.ok && verifyIntegrity.data.balanceCache.ok ? 'All checks passed' : 'Integrity problem found'}
+            >
+              <p>
+                Ledger chain: {verifyIntegrity.data.ledger.ok ? `OK (${verifyIntegrity.data.ledger.checked} rows)` : `BROKEN at row ${verifyIntegrity.data.ledger.brokenAt} — ${verifyIntegrity.data.ledger.reason}`} · Audit chain:{' '}
+                {verifyIntegrity.data.audit.ok ? `OK (${verifyIntegrity.data.audit.checked} rows)` : `BROKEN at row ${verifyIntegrity.data.audit.brokenAt} — ${verifyIntegrity.data.audit.reason}`} · Balance cache:{' '}
+                {verifyIntegrity.data.balanceCache.ok ? 'OK' : `${verifyIntegrity.data.balanceCache.driftedGoals.length} goal(s) drifted`}
+              </p>
+            </Notice>
+          ) : null}
+          {verifyIntegrity.isError ? <Notice tone="error">{errorMessage(verifyIntegrity.error)}</Notice> : null}
+        </section>
 
         <section className="card stack" aria-labelledby="recon-title">
           <div className="row-between">
@@ -203,6 +255,7 @@ export function OpsPage() {
               ['events', 'Partner events'],
               ['users', 'Users'],
               ['audit', 'Audit log'],
+              ['security', 'Security'],
             ] as const
           ).map(([value, label]) => (
             <button key={value} type="button" role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>
@@ -377,6 +430,21 @@ export function OpsPage() {
             />
           ) : null}
 
+          {tab === 'security' ? (
+            <Table
+              loading={security.isPending}
+              error={security.error}
+              empty="No security events. Failed sign-ins, blocked cross-site requests, rate-limit hits and rejected webhooks appear here."
+              head={['When', 'Event', 'Subject (hashed)', 'Detail']}
+              rows={(security.data ?? []).map((e) => [
+                <span className="tiny">{formatDateTimeIN(e.createdAt)}</span>,
+                <span className={`badge ${e.type.includes('failed') || e.type.includes('replay') || e.type.includes('locked') ? 'badge--failed' : 'badge--pending'}`}>{e.type}</span>,
+                <span className="mono">{e.subject ?? '—'}</span>,
+                <span className="mono">{e.detail ?? '—'}</span>,
+              ])}
+            />
+          ) : null}
+
           {tab === 'audit' ? (
             <Table
               loading={audit.isPending}
@@ -484,8 +552,11 @@ function Table({ head, rows, loading, error, empty }: { head: string[]; rows: Re
 
 function OpsLogin({ onDone }: { onDone: () => void }) {
   const [passcode, setPasscode] = useState('');
+  const [code, setCode] = useState('');
+  const options = useQuery({ queryKey: ['ops-login-options'], queryFn: () => api<{ mfaRequired: boolean }>('/api/ops/login-options') });
+  const mfa = options.data?.mfaRequired ?? false;
   const login = useMutation({
-    mutationFn: () => api('/api/ops/session', { method: 'POST', body: { passcode } }),
+    mutationFn: () => api('/api/ops/session', { method: 'POST', body: mfa ? { passcode, code } : { passcode } }),
     onSuccess: onDone,
   });
   const submit = (e: FormEvent) => {
@@ -508,8 +579,23 @@ function OpsLogin({ onDone }: { onDone: () => void }) {
             <input id="passcode" type="password" className="input" value={passcode} onChange={(e) => setPasscode(e.target.value)} autoComplete="current-password" />
             <span className="hint">Set by OPERATOR_PASSCODE in .env (default from setup: gullak-ops-demo).</span>
           </div>
+          {mfa ? (
+            <div className="field">
+              <label htmlFor="totp">Authenticator code</label>
+              <input
+                id="totp"
+                className="input otp-input"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
+              />
+              <span className="hint">6-digit code from your authenticator app (multi-factor sign-in is on).</span>
+            </div>
+          ) : null}
           {login.isError ? <Notice tone="error">{errorMessage(login.error)}</Notice> : null}
-          <button type="submit" className="btn btn--primary" disabled={!passcode || login.isPending}>
+          <button type="submit" className="btn btn--primary" disabled={!passcode || (mfa && code.length !== 6) || login.isPending}>
             Sign in
           </button>
           <a href="/" className="small">
